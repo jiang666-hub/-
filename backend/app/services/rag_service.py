@@ -1,5 +1,6 @@
 """
 RAG 检索增强生成服务 - 基于 Chroma 向量数据库
+Render 免费版内存有限，RAG 可能不可用，此时自动降级为关键词搜索
 """
 import os
 from typing import List, Tuple
@@ -8,12 +9,25 @@ from app.core.config import CHROMA_PERSIST_DIR, EMBEDDING_MODEL, DATA_DIR
 
 class RAGService:
     def __init__(self):
-        # 延迟导入，避免 sentence-transformers 的 Keras 兼容性问题导致整个模块加载失败
+        self._ready = False
+        self.client = None
+        self.embedder = None
+
+        # 检查 chromadb 和 sentence_transformers 是否可用
         try:
             import chromadb
             from chromadb.config import Settings as ChromaSettings
-            from sentence_transformers import SentenceTransformer
+        except ImportError:
+            print("[RAG] chromadb 未安装，RAG 服务不可用")
+            return
 
+        try:
+            from sentence_transformers import SentenceTransformer
+        except ImportError:
+            print("[RAG] sentence-transformers 未安装，RAG 服务不可用")
+            return
+
+        try:
             self.client = chromadb.PersistentClient(
                 path=CHROMA_PERSIST_DIR,
                 settings=ChromaSettings(anonymized_telemetry=False)
@@ -21,36 +35,29 @@ class RAGService:
             self.embedder = SentenceTransformer(EMBEDDING_MODEL)
             self._ready = True
         except Exception as e:
-            print(f"[RAG] 初始化失败，将使用关键词匹配模式: {e}")
-            self._ready = False
-            self.client = None
-            self.embedder = None
+            print(f"[RAG] 初始化失败: {e}")
+            return
 
         if self._ready:
             self._init_collections()
 
     def _init_collections(self):
         """初始化向量集合"""
-        # 图书信息集合
         self.book_collection = self.client.get_or_create_collection(
             name="library_books",
             metadata={"description": "图书馆藏信息向量库"}
         )
-
-        # 规章制度集合
         self.rules_collection = self.client.get_or_create_collection(
             name="library_rules",
             metadata={"description": "图书馆规章制度向量库"}
         )
 
-        # 如果集合为空则加载数据
         if self.book_collection.count() == 0:
             self._load_books()
         if self.rules_collection.count() == 0:
             self._load_rules()
 
     def _load_books(self):
-        """将图书信息向量化并存入 Chroma"""
         import json
         books_path = os.path.join(DATA_DIR, "books", "books.json")
         with open(books_path, "r", encoding="utf-8") as f:
@@ -59,6 +66,7 @@ class RAGService:
         documents = []
         ids = []
         metadatas = []
+        batch_size = 200
 
         for book in books:
             text = (
@@ -76,22 +84,24 @@ class RAGService:
                 "category": book["category"]
             })
 
-        embeddings = self.embedder.encode(documents).tolist()
-        self.book_collection.add(
-            ids=ids,
-            documents=documents,
-            embeddings=embeddings,
-            metadatas=metadatas
-        )
-        print(f"已加载 {len(books)} 本图书到向量库")
+        for i in range(0, len(documents), batch_size):
+            batch_docs = documents[i:i+batch_size]
+            batch_ids = ids[i:i+batch_size]
+            batch_meta = metadatas[i:i+batch_size]
+            embeddings = self.embedder.encode(batch_docs).tolist()
+            self.book_collection.add(
+                ids=batch_ids,
+                documents=batch_docs,
+                embeddings=embeddings,
+                metadatas=batch_meta
+            )
+        print(f"[RAG] 已加载 {len(books)} 本图书到向量库")
 
     def _load_rules(self):
-        """将规章制度向量化并存入 Chroma"""
         rules_path = os.path.join(DATA_DIR, "knowledge", "rules.md")
         with open(rules_path, "r", encoding="utf-8") as f:
             content = f.read()
 
-        # 按 ## 二级标题分段
         sections = content.split("\n## ")
         documents = []
         ids = []
@@ -108,10 +118,9 @@ class RAGService:
                 documents=documents,
                 embeddings=embeddings
             )
-            print(f"已加载 {len(documents)} 条规章制度到向量库")
+            print(f"[RAG] 已加载 {len(documents)} 条规章制度到向量库")
 
     def search_books(self, query: str, top_k: int = 5) -> List[Tuple[str, float]]:
-        """语义搜索图书"""
         if not self._ready:
             return []
         query_embedding = self.embedder.encode([query]).tolist()
@@ -122,7 +131,6 @@ class RAGService:
         return list(zip(results["ids"][0], results["distances"][0]))
 
     def search_rules(self, query: str, top_k: int = 3) -> List[str]:
-        """语义搜索规章制度"""
         if not self._ready:
             return []
         query_embedding = self.embedder.encode([query]).tolist()
@@ -133,12 +141,15 @@ class RAGService:
         return results["documents"][0] if results["documents"] else []
 
 
-# 延迟初始化单例，避免导入时崩溃
+# 延迟初始化单例
 _rag_instance = None
 
 
 def get_rag_service():
     global _rag_instance
     if _rag_instance is None:
-        _rag_instance = RAGService()
-    return _rag_instance
+        try:
+            _rag_instance = RAGService()
+        except Exception:
+            _rag_instance = False
+    return _rag_instance if _rag_instance is not False else None
