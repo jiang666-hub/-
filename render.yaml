@@ -1,0 +1,9 @@
+# Render 部署配置 - 免费一键部署到公网
+# 访问 https://render.com 注册，连接 GitHub 仓库，自动部署
+services:
+  - type: web
+    name: library-agent
+    env: python
+    buildCommand: cd backend && pip install -r requirements.txt
+    startCommand: cd backend && python -m uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    plan: free
